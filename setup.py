@@ -1,12 +1,11 @@
-from pathlib import Path
-
 from setuptools import setup
 from Cython.Build import cythonize
+import os
 
-source = Path(__file__).resolve().parent.parent / "src_backup" / "shieldcore_waf.py"
-
+# البحث الديناميكي عن كافة ملفات python لتحويلها دون الاعتماد على مسارات مطلقة
 setup(
-    name="henzo_waf_native",
-    ext_modules=cythonize([str(source)], language_level=3),
-    script_args=["build_ext", "--inplace"],
+    ext_modules=cythonize(
+        ["protected_runtime/*.py"],
+        compiler_directives={'language_level': "3"}
+    )
 )
