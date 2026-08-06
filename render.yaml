@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: henzo-waf-demo
+    env: python
+    buildCommand: sh build.sh
+    startCommand: sh start.sh

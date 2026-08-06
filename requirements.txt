@@ -1,0 +1,10 @@
+# Minimal runtime and build requirements for the deployment bundle
+fastapi==0.139.0
+uvicorn==0.34.2
+websockets==11.0.3
+httpx==0.28.1
+wsproto==1.2.0
+redis==5.2.0
+aiofiles==24.1.0
+python-multipart==0.0.32
+cython==3.2.9
