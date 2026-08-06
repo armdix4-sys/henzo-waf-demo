@@ -17,38 +17,57 @@ import redis.asyncio as aioredis
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+# ضبط متغيرات البيئة الخاصة بالـ WAF
 os.environ.setdefault("WAF_DETECTION_RULES_LAYER_MODE", "active_block")
 os.environ.setdefault("WAF_REPUTATION_CHALLENGE_THRESHOLD", "3")
 os.environ.setdefault("WAF_REPUTATION_BLOCK_THRESHOLD", "5")
 
-PROTECTED_ROOT = Path(__file__).resolve().parent / "protected_runtime"
+# إجبار بايثون على إضافة المسار الرئيسي ومجلد protected_runtime إلى sys.path
+BASE_DIR = Path(__file__).resolve().parent
+PROTECTED_ROOT = BASE_DIR / "protected_runtime"
+
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
 if str(PROTECTED_ROOT) not in sys.path:
     sys.path.insert(0, str(PROTECTED_ROOT))
 
-sys.path.insert(0, str(PROTECTED_ROOT))
-
+# استيراد مرن يتكيف سواء كانت الوحدات مجمعة كـ Cython أو بايثون عادي
 try:
-    import protected_runtime.analysis.signature_matching as analysis_signature_matching
-    import protected_runtime.shieldcore_waf as shieldcore_waf_runtime
-    import protected_runtime.core.proxy_token as core_proxy_token_runtime
-    import protected_runtime.logic_engine as logic_engine_runtime
-    import protected_runtime.analysis.signature_matching as protected_signature_matching
+    import analysis_signature_matching as analysis_signature_matching
+    import shieldcore_waf as shieldcore_waf_runtime
+    import core_proxy_token as core_proxy_token_runtime
+    import logic_engine as logic_engine_runtime
+    import signature_matching as protected_signature_matching
+    
     SignatureMatchingLayer = protected_signature_matching.SignatureMatchingLayer
     DetectionRulesLayer = shieldcore_waf_runtime.DetectionRulesLayer
     build_proxy_token = core_proxy_token_runtime.build_proxy_token
     BusinessLogicEngine = logic_engine_runtime.BusinessLogicEngine
-except Exception:
-    import protected_runtime.analysis_signature_matching as analysis_signature_matching
-    import protected_runtime.shieldcore_waf as shieldcore_waf_runtime
-    import protected_runtime.core_proxy_token as core_proxy_token_runtime
-    import protected_runtime.logic_engine as logic_engine_runtime
-    import protected_runtime.signature_matching as protected_signature_matching
-    SignatureMatchingLayer = protected_signature_matching.SignatureMatchingLayer
-    DetectionRulesLayer = shieldcore_waf_runtime.DetectionRulesLayer
-    build_proxy_token = core_proxy_token_runtime.build_proxy_token
-    BusinessLogicEngine = logic_engine_runtime.BusinessLogicEngine
+except ImportError:
+    try:
+        import protected_runtime.analysis.signature_matching as analysis_signature_matching
+        import protected_runtime.shieldcore_waf as shieldcore_waf_runtime
+        import protected_runtime.core.proxy_token as core_proxy_token_runtime
+        import protected_runtime.logic_engine as logic_engine_runtime
+        import protected_runtime.analysis.signature_matching as protected_signature_matching
+        
+        SignatureMatchingLayer = protected_signature_matching.SignatureMatchingLayer
+        DetectionRulesLayer = shieldcore_waf_runtime.DetectionRulesLayer
+        build_proxy_token = core_proxy_token_runtime.build_proxy_token
+        BusinessLogicEngine = logic_engine_runtime.BusinessLogicEngine
+    except Exception:
+        import protected_runtime.analysis_signature_matching as analysis_signature_matching
+        import protected_runtime.shieldcore_waf as shieldcore_waf_runtime
+        import protected_runtime.core_proxy_token as core_proxy_token_runtime
+        import protected_runtime.logic_engine as logic_engine_runtime
+        import protected_runtime.signature_matching as protected_signature_matching
+        
+        SignatureMatchingLayer = protected_signature_matching.SignatureMatchingLayer
+        DetectionRulesLayer = shieldcore_waf_runtime.DetectionRulesLayer
+        build_proxy_token = core_proxy_token_runtime.build_proxy_token
+        BusinessLogicEngine = logic_engine_runtime.BusinessLogicEngine
 
-# Prefer the protected shim explicitly when the source tree is backed up.
 if "analysis.signature_matching" not in sys.modules:
     sys.modules["analysis.signature_matching"] = analysis_signature_matching
 
@@ -75,10 +94,9 @@ detection_layer = DetectionRulesLayer()
 _RATE_LIMIT_BUCKETS: dict[str, deque[float]] = defaultdict(deque)
 _RATE_LIMIT_LOCK = Lock()
 
-# Business logic engine (uses redis when available)
 business_engine: BusinessLogicEngine | None = None
-
 redis_client = None
+
 http_client = httpx.AsyncClient(
     timeout=httpx.Timeout(3.0, connect=1.0, read=3.0),
     limits=httpx.Limits(max_connections=1000, max_keepalive_connections=200),
@@ -169,7 +187,6 @@ async def normalize_and_route(request: Request, call_next):
     if _is_early_rate_limited(request):
         return JSONResponse(status_code=429, content={"detail": "Too Many Requests"})
 
-    # Lightweight normalization pass for the lab scenario.
     normalized_path = request.url.path
     normalized_query = request.url.query
     if request.method in {"POST", "PUT", "PATCH"}:
@@ -181,6 +198,7 @@ async def normalize_and_route(request: Request, call_next):
             body = b""
     else:
         body = b""
+
     if len(body) > 8192:
         return JSONResponse(status_code=413, content={"detail": "payload_too_large"})
 
@@ -200,10 +218,10 @@ async def normalize_and_route(request: Request, call_next):
             tokens = {token.strip().lower() for token in header_value.split(",") if token.strip()}
             if tokens & {"x-forwarded-for", "x-real-ip", "x-forwarded-proto", "x-forwarded-host", "x-forwarded-port", "proxy-authorization", "proxy-connection", "te", "transfer-encoding", "upgrade", "forwarded", "x-shieldcore-signature", "x-shieldcore-timestamp"}:
                 suspicious_headers.append(header_name)
+
     if suspicious_headers:
         return JSONResponse(status_code=403, content={"detail": "header_spoofing_attempt"})
 
-    # Pass through to the detection layer.
     detection_result = detection_layer.process({
         "method": request.method,
         "path": normalized_path,
@@ -217,7 +235,6 @@ async def normalize_and_route(request: Request, call_next):
     if detection_result.get("verdict") == "challenge":
         return JSONResponse(status_code=403, content={"detail": "challenge_required"})
 
-    # Business logic checks: run only for state-changing or payload-bearing requests.
     payload = None
     if request.method in {"POST", "PUT", "PATCH"}:
         try:
@@ -254,6 +271,7 @@ async def normalize_and_route(request: Request, call_next):
                 return JSONResponse(status_code=403, content={"detail": "idor_violation", "reason": reason})
         except Exception:
             pass
+
     headers = {}
     for k, v in request.headers.items():
         name = k.lower()
@@ -279,6 +297,7 @@ async def normalize_and_route(request: Request, call_next):
     signature = hmac.new(SHARED_SECRET.encode("utf-8"), payload, hashlib.sha256).hexdigest()
     headers["X-ShieldCore-Signature"] = f"{signature_timestamp}:{signature}"
     headers["X-ShieldCore-Timestamp"] = signature_timestamp
+
     try:
         rclient = await get_redis_client()
         if rclient is not None:
@@ -286,6 +305,7 @@ async def normalize_and_route(request: Request, call_next):
             await rclient.expire(f"shieldcore:reputation:{request.client.host if request.client else 'unknown'}", 300)
     except Exception:
         pass
+
     upstream_url = f"{TARGET_URL}{request.url.path}"
     try:
         if request.method == "GET":
