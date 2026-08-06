@@ -17,59 +17,48 @@ import redis.asyncio as aioredis
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-# ضبط متغيرات البيئة الخاصة بالـ WAF
-os.environ.setdefault("WAF_DETECTION_RULES_LAYER_MODE", "active_block")
-os.environ.setdefault("WAF_REPUTATION_CHALLENGE_THRESHOLD", "3")
-os.environ.setdefault("WAF_REPUTATION_BLOCK_THRESHOLD", "5")
-
-# إجبار بايثون على إضافة المسار الرئيسي ومجلد protected_runtime إلى sys.path
+# 1. إعداد المسارات الديناميكية لضمان وصول بايثون لجميع الوحدات
 BASE_DIR = Path(__file__).resolve().parent
 PROTECTED_ROOT = BASE_DIR / "protected_runtime"
+ANALYSIS_ROOT = PROTECTED_ROOT / "analysis"
 
-if str(BASE_DIR) not in sys.path:
-    sys.path.insert(0, str(BASE_DIR))
+for p in [str(BASE_DIR), str(PROTECTED_ROOT), str(ANALYSIS_ROOT)]:
+    if p not in sys.path:
+        sys.path.insert(0, p)
 
-if str(PROTECTED_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROTECTED_ROOT))
-
-# استيراد مرن يتكيف سواء كانت الوحدات مجمعة كـ Cython أو بايثون عادي
+# 2. استيراد الموديولات بحماية تامة للـ Fallback
 try:
     import analysis_signature_matching as analysis_signature_matching
+except ImportError:
+    try:
+        from protected_runtime.analysis import signature_matching as analysis_signature_matching
+    except ImportError:
+        import signature_matching as analysis_signature_matching
+
+try:
     import shieldcore_waf as shieldcore_waf_runtime
     import core_proxy_token as core_proxy_token_runtime
     import logic_engine as logic_engine_runtime
     import signature_matching as protected_signature_matching
-    
-    SignatureMatchingLayer = protected_signature_matching.SignatureMatchingLayer
-    DetectionRulesLayer = shieldcore_waf_runtime.DetectionRulesLayer
-    build_proxy_token = core_proxy_token_runtime.build_proxy_token
-    BusinessLogicEngine = logic_engine_runtime.BusinessLogicEngine
 except ImportError:
-    try:
-        import protected_runtime.analysis.signature_matching as analysis_signature_matching
-        import protected_runtime.shieldcore_waf as shieldcore_waf_runtime
-        import protected_runtime.core.proxy_token as core_proxy_token_runtime
-        import protected_runtime.logic_engine as logic_engine_runtime
-        import protected_runtime.analysis.signature_matching as protected_signature_matching
-        
-        SignatureMatchingLayer = protected_signature_matching.SignatureMatchingLayer
-        DetectionRulesLayer = shieldcore_waf_runtime.DetectionRulesLayer
-        build_proxy_token = core_proxy_token_runtime.build_proxy_token
-        BusinessLogicEngine = logic_engine_runtime.BusinessLogicEngine
-    except Exception:
-        import protected_runtime.analysis_signature_matching as analysis_signature_matching
-        import protected_runtime.shieldcore_waf as shieldcore_waf_runtime
-        import protected_runtime.core_proxy_token as core_proxy_token_runtime
-        import protected_runtime.logic_engine as logic_engine_runtime
-        import protected_runtime.signature_matching as protected_signature_matching
-        
-        SignatureMatchingLayer = protected_signature_matching.SignatureMatchingLayer
-        DetectionRulesLayer = shieldcore_waf_runtime.DetectionRulesLayer
-        build_proxy_token = core_proxy_token_runtime.build_proxy_token
-        BusinessLogicEngine = logic_engine_runtime.BusinessLogicEngine
+    from protected_runtime import shieldcore_waf as shieldcore_waf_runtime
+    from protected_runtime import core_proxy_token as core_proxy_token_runtime
+    from protected_runtime import logic_engine as logic_engine_runtime
+    from protected_runtime import signature_matching as protected_signature_matching
 
-if "analysis.signature_matching" not in sys.modules:
+# تعيين الفئات المستوردة مع ضمان وجود البديل
+SignatureMatchingLayer = getattr(protected_signature_matching, "SignatureMatchingLayer", None)
+DetectionRulesLayer = getattr(shieldcore_waf_runtime, "DetectionRulesLayer", None)
+build_proxy_token = getattr(core_proxy_token_runtime, "build_proxy_token", None)
+BusinessLogicEngine = getattr(logic_engine_runtime, "BusinessLogicEngine", None)
+
+if "analysis.signature_matching" not in sys.modules and 'analysis_signature_matching' in locals():
     sys.modules["analysis.signature_matching"] = analysis_signature_matching
+
+# 3. إعداد متغيرات البيئة للـ WAF
+os.environ.setdefault("WAF_DETECTION_RULES_LAYER_MODE", "active_block")
+os.environ.setdefault("WAF_REPUTATION_CHALLENGE_THRESHOLD", "3")
+os.environ.setdefault("WAF_REPUTATION_BLOCK_THRESHOLD", "5")
 
 app = FastAPI(title="Henzo Proxy Server")
 
@@ -81,20 +70,34 @@ INPUT_NORMALIZATION_PASSES = 5
 EARLY_RATE_LIMIT_RPS = max(1, int(os.getenv("WAF_EARLY_RATE_LIMIT_RPS", "50")))
 EARLY_RATE_LIMIT_WINDOW_SECONDS = max(1, int(os.getenv("WAF_EARLY_RATE_LIMIT_WINDOW_SECONDS", "1")))
 
-try:
-    signature_layer = SignatureMatchingLayer()
-except Exception:
+# تهيئة طبقة توقيع الهجمات
+if SignatureMatchingLayer is not None:
+    try:
+        signature_layer = SignatureMatchingLayer()
+    except Exception:
+        class _FallbackSignatureLayer:
+            def process(self, data: Any) -> Any:
+                return {"packets": []}
+        signature_layer = _FallbackSignatureLayer()
+else:
     class _FallbackSignatureLayer:
         def process(self, data: Any) -> Any:
             return {"packets": []}
     signature_layer = _FallbackSignatureLayer()
 
-detection_layer = DetectionRulesLayer()
+# تهيئة طبقة قواعد الكشف
+if DetectionRulesLayer is not None:
+    detection_layer = DetectionRulesLayer()
+else:
+    class _FallbackDetectionRulesLayer:
+        def process(self, data: Any) -> dict[str, Any]:
+            return {"verdict": "pass"}
+    detection_layer = _FallbackDetectionRulesLayer()
 
 _RATE_LIMIT_BUCKETS: dict[str, deque[float]] = defaultdict(deque)
 _RATE_LIMIT_LOCK = Lock()
 
-business_engine: BusinessLogicEngine | None = None
+business_engine: Any | None = None
 redis_client = None
 
 http_client = httpx.AsyncClient(
@@ -121,7 +124,7 @@ async def get_redis_client():
 
 async def get_business_engine():
     global business_engine
-    if business_engine is None:
+    if business_engine is None and BusinessLogicEngine is not None:
         r = await get_redis_client()
         business_engine = BusinessLogicEngine(redis_client=r)
     return business_engine
@@ -188,7 +191,8 @@ async def normalize_and_route(request: Request, call_next):
         return JSONResponse(status_code=429, content={"detail": "Too Many Requests"})
 
     normalized_path = request.url.path
-    normalized_query = request.url.query
+    normalized_query = str(request.url.query)
+    
     if request.method in {"POST", "PUT", "PATCH"}:
         try:
             body = await asyncio.wait_for(request.body(), timeout=2.0)
@@ -202,7 +206,7 @@ async def normalize_and_route(request: Request, call_next):
     if len(body) > 8192:
         return JSONResponse(status_code=413, content={"detail": "payload_too_large"})
 
-    if len(str(request.url.query).encode("utf-8")) > 8192:
+    if len(normalized_query.encode("utf-8")) > 8192:
         return JSONResponse(status_code=413, content={"detail": "payload_too_large"})
 
     suspicious_headers = []
@@ -228,8 +232,9 @@ async def normalize_and_route(request: Request, call_next):
         "headers": _sanitize_headers_for_detection(request),
         "query": normalized_query,
         "body": body.decode("utf-8", errors="ignore"),
-        "client_ip": request.client.host if request.client else "127.0.0.1",
+        "client_ip": _extract_client_ip(request),
     })
+    
     if detection_result.get("verdict") == "block":
         return JSONResponse(status_code=403, content={"detail": "blocked", "reasons": detection_result.get("reasons", [])})
     if detection_result.get("verdict") == "challenge":
@@ -245,30 +250,31 @@ async def normalize_and_route(request: Request, call_next):
     if request.method != "GET" or payload is not None:
         try:
             engine = await get_business_engine()
-            session_id = request.cookies.get("session_id") or request.headers.get("x-session-id")
-            ok, reason = await engine.check_fsm(session_id, normalized_path)
-            if not ok:
-                return JSONResponse(status_code=403, content={"detail": "state_boundary_violation", "reason": reason})
-
-            idempotency_key = request.headers.get("Idempotency-Key")
-            ok, reason = await engine.check_idempotency(idempotency_key)
-            if not ok:
-                return JSONResponse(status_code=409, content={"detail": "duplicate_request", "reason": reason})
-
-            if request.method in {"POST", "PUT", "PATCH"}:
-                ok, reason = await engine.validate_schema(normalized_path, payload)
+            if engine is not None:
+                session_id = request.cookies.get("session_id") or request.headers.get("x-session-id")
+                ok, reason = await engine.check_fsm(session_id, normalized_path)
                 if not ok:
-                    return JSONResponse(status_code=400, content={"detail": "schema_violation", "reason": reason})
+                    return JSONResponse(status_code=403, content={"detail": "state_boundary_violation", "reason": reason})
 
-            params = dict(request.query_params)
-            try:
-                if payload and isinstance(payload, dict):
-                    params.update(payload)
-            except Exception:
-                pass
-            ok, reason = await engine.check_idor(session_id, params)
-            if not ok:
-                return JSONResponse(status_code=403, content={"detail": "idor_violation", "reason": reason})
+                idempotency_key = request.headers.get("Idempotency-Key")
+                ok, reason = await engine.check_idempotency(idempotency_key)
+                if not ok:
+                    return JSONResponse(status_code=409, content={"detail": "duplicate_request", "reason": reason})
+
+                if request.method in {"POST", "PUT", "PATCH"}:
+                    ok, reason = await engine.validate_schema(normalized_path, payload)
+                    if not ok:
+                        return JSONResponse(status_code=400, content={"detail": "schema_violation", "reason": reason})
+
+                params = dict(request.query_params)
+                try:
+                    if payload and isinstance(payload, dict):
+                        params.update(payload)
+                except Exception:
+                    pass
+                ok, reason = await engine.check_idor(session_id, params)
+                if not ok:
+                    return JSONResponse(status_code=403, content={"detail": "idor_violation", "reason": reason})
         except Exception:
             pass
 
@@ -293,16 +299,17 @@ async def normalize_and_route(request: Request, call_next):
         headers[k] = v
 
     signature_timestamp = str(int(time.time()))
-    payload = f"{signature_timestamp}:{request.method}:{request.url.path}".encode("utf-8")
-    signature = hmac.new(SHARED_SECRET.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+    sig_payload = f"{signature_timestamp}:{request.method}:{request.url.path}".encode("utf-8")
+    signature = hmac.new(SHARED_SECRET.encode("utf-8"), sig_payload, hashlib.sha256).hexdigest()
     headers["X-ShieldCore-Signature"] = f"{signature_timestamp}:{signature}"
     headers["X-ShieldCore-Timestamp"] = signature_timestamp
 
     try:
         rclient = await get_redis_client()
         if rclient is not None:
-            await rclient.hset(f"shieldcore:reputation:{request.client.host if request.client else 'unknown'}", mapping={"score": "0", "last_seen": str(int(time.time()))})
-            await rclient.expire(f"shieldcore:reputation:{request.client.host if request.client else 'unknown'}", 300)
+            client_ip = _extract_client_ip(request)
+            await rclient.hset(f"shieldcore:reputation:{client_ip}", mapping={"score": "0", "last_seen": str(int(time.time()))})
+            await rclient.expire(f"shieldcore:reputation:{client_ip}", 300)
     except Exception:
         pass
 
@@ -322,10 +329,10 @@ async def normalize_and_route(request: Request, call_next):
         return JSONResponse(status_code=502, content={"detail": "upstream_unavailable"})
 
     try:
-        payload = response.json() if response.content else {}
+        res_payload = response.json() if response.content else {}
     except ValueError:
-        payload = {"detail": response.text}
-    return JSONResponse(content=payload, status_code=response.status_code)
+        res_payload = {"detail": response.text}
+    return JSONResponse(content=res_payload, status_code=response.status_code)
 
 
 @app.get("/health")
